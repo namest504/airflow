@@ -4978,6 +4978,94 @@ class TestSchedulerJob:
         mock_executors[0].fail.assert_called()
 
     @conf_vars({("scheduler", "num_stuck_in_queued_retries"): "2"})
+    def test_stuck_queued_handling_skips_task_that_left_queued(self, dag_maker, session, mock_executors):
+        """A task that starts and defers after it was selected as stuck must keep its deferred state.
+
+        Rescheduling it would clear the queued state while trigger_id and next_method stay set, so the
+        next worker resumes execute_complete() and the sensor succeeds before its trigger fired.
+        """
+        with dag_maker("test_stuck_queued_left_queued"):
+            EmptyOperator(task_id="op1")
+
+        dr = dag_maker.create_dagrun(run_id=str(uuid4()))
+        ti = dr.get_task_instance(task_id="op1", session=session)
+        ti.state = TaskInstanceState.QUEUED
+        ti.queued_dttm = timezone.utcnow()
+        session.commit()
+        ti_id = ti.id
+
+        trigger = Trigger(classpath="airflow.providers.standard.triggers.temporal.DateTimeTrigger", kwargs={})
+        session.add(trigger)
+        session.flush()
+        trigger_id = trigger.id
+
+        def worker_runs_and_defers(ti):
+            # The worker picked the task up between the stuck-in-queued query and the revoke call.
+            with create_session() as worker_session:
+                worker_session.execute(
+                    update(TaskInstance)
+                    .where(TaskInstance.id == ti_id)
+                    .values(
+                        state=TaskInstanceState.DEFERRED,
+                        trigger_id=trigger_id,
+                        next_method="execute_complete",
+                        next_kwargs={},
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+
+        mock_executors[0].revoke_task.side_effect = worker_runs_and_defers
+        scheduler = SchedulerJobRunner(job=Job(), num_runs=0)
+        scheduler._task_queued_timeout = -300  # always in violation of timeout
+
+        with _loader_mock(mock_executors):
+            scheduler._handle_tasks_stuck_in_queued()
+
+        session.expire_all()
+        ti = session.get(TaskInstance, ti_id)
+        assert ti.state == TaskInstanceState.DEFERRED
+        assert ti.trigger_id == trigger_id
+        assert ti.next_method == "execute_complete"
+        assert session.scalar(select(func.count()).where(Log.task_instance_id == ti_id)) == 0
+
+    def test_stuck_queued_handling_does_not_revoke_task_that_started(
+        self, dag_maker, session, mock_executors
+    ):
+        """A task that started after it was selected as stuck must not be revoked from the executor."""
+        with dag_maker("test_stuck_queued_started"):
+            EmptyOperator(task_id="op1")
+
+        dr = dag_maker.create_dagrun(run_id=str(uuid4()))
+        ti = dr.get_task_instance(task_id="op1", session=session)
+        ti.state = TaskInstanceState.QUEUED
+        ti.queued_dttm = timezone.utcnow()
+        session.commit()
+
+        scheduler = SchedulerJobRunner(job=Job(), num_runs=0)
+        scheduler._task_queued_timeout = -300  # always in violation of timeout
+        stuck_tis = list(scheduler._get_tis_stuck_in_queued(session))
+        assert [stuck.id for stuck in stuck_tis] == [ti.id]
+
+        # The worker started the task after the stuck-in-queued query ran.
+        with create_session() as worker_session:
+            worker_session.execute(
+                update(TaskInstance)
+                .where(TaskInstance.id == ti.id)
+                .values(state=TaskInstanceState.RUNNING)
+                .execution_options(synchronize_session=False)
+            )
+
+        with (
+            _loader_mock(mock_executors),
+            patch.object(scheduler, "_get_tis_stuck_in_queued", return_value=stuck_tis),
+        ):
+            scheduler._handle_tasks_stuck_in_queued()
+
+        mock_executors[0].revoke_task.assert_not_called()
+        session.expire_all()
+        assert session.get(TaskInstance, ti.id).state == TaskInstanceState.RUNNING
+
+    @conf_vars({("scheduler", "num_stuck_in_queued_retries"): "2"})
     def test_handle_stuck_queued_tasks_reschedule_sensors(self, dag_maker, session, mock_executors):
         """Reschedule sensors go in and out of running repeatedly using the same try_number
         Make sure that they get three attempts per reschedule, not 3 attempts per try_number"""
