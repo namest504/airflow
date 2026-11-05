@@ -948,6 +948,39 @@ def test_prior_dates_ignores_values_of_archived_expansion_task_instances(
     assert response.status_code == 404
 
 
+def test_prior_dates_cutoff_comes_from_the_callers_run_for_cross_dag_pulls(
+    client, dag_maker, session, authenticate_as
+):
+    """``xcom_pull(dag_id=other, include_prior_dates=True)`` sends the caller's run_id, which does
+    not exist in the producer Dag. The cutoff must come from the caller's run, not a run of the
+    producer Dag with the same id."""
+    with dag_maker("upstream_dag", serialized=True):
+        EmptyOperator(task_id="push")
+    before = dag_maker.create_dagrun(run_id="up_before", logical_date=timezone.datetime(2026, 1, 1))
+    after = dag_maker.create_dagrun(run_id="up_after", logical_date=timezone.datetime(2026, 1, 5))
+    with dag_maker("downstream_dag", serialized=True):
+        EmptyOperator(task_id="pull")
+    current = dag_maker.create_dagrun(run_id="down_current", logical_date=timezone.datetime(2026, 1, 3))
+    for run, value in ((before, "before"), (after, "after")):
+        XComModel.set_for_attempt(
+            task_instance_id=run.task_instances[0].id,
+            key="key",
+            value=value,
+            serialize=False,
+            session=session,
+        )
+    session.commit()
+    authenticate_as(current.task_instances[0])
+
+    response = client.get(
+        f"/execution/xcoms/upstream_dag/{current.run_id}/push/key",
+        params={"include_prior_dates": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"key": "key", "value": "before"}
+
+
 @pytest.fixture(autouse=True)
 def reset_db():
     """Reset XCom entries."""

@@ -198,6 +198,7 @@ def _build_xcom_read(
     loop, it covers every iteration of the task rather than the one a caller inside the loop would see.
     """
     resolver = TaskCoordinateResolver(dag_bag, session)
+    caller = session.get(TaskInstance, token.id) if token.claims.scope == "execution" else None
     read = partial(
         XComModel.get_many,
         dag_ids=dag_id,
@@ -205,6 +206,9 @@ def _build_xcom_read(
         task_ids=task_id,
         key=key,
         include_prior_dates=include_prior_dates,
+        # ``run_id`` is the caller's run, which belongs to the caller's Dag when it pulls from
+        # another Dag. Without a caller, assume the run is one of the producer Dag.
+        cutoff_dag_id=caller.dag_id if caller is not None else None,
     )
     try:
         if previous_iteration and include_prior_dates:
@@ -213,7 +217,6 @@ def _build_xcom_read(
             dag_id, None if include_prior_dates else run_id, task_id
         ):
             return _XComRead(read(region_id=SENTINEL_REGION_ID, map_indexes=map_index))
-        caller = session.get(TaskInstance, token.id) if token.claims.scope == "execution" else None
         if include_prior_dates:
             task = None
             if session.scalar(select(DagRun.id).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id)):

@@ -419,6 +419,41 @@ class TestXComGet:
             json.dumps({"key": "dag_1_earlier"}),
         ]
 
+    def test_xcom_get_many_from_prior_dates_across_dags(
+        self, session, task_instance_factory, push_simple_json_xcom
+    ):
+        """The cutoff comes from the caller's run, which belongs to a different Dag than the producer."""
+        producer_before = task_instance_factory(
+            dag_id="upstream_dag",
+            task_id="push",
+            logical_date=timezone.datetime(2021, 12, 1, 4, 56),
+        )
+        producer_after = task_instance_factory(
+            dag_id="upstream_dag",
+            task_id="push",
+            logical_date=timezone.datetime(2021, 12, 5, 4, 56),
+        )
+        caller = task_instance_factory(
+            dag_id="downstream_dag",
+            task_id="pull",
+            logical_date=timezone.datetime(2021, 12, 3, 4, 56),
+        )
+        push_simple_json_xcom(ti=producer_before, key="xcom_1", value={"key": "before"})
+        push_simple_json_xcom(ti=producer_after, key="xcom_1", value={"key": "after"})
+
+        stored_xcoms = session.scalars(
+            XComModel.get_many(
+                run_id=caller.run_id,
+                key="xcom_1",
+                dag_ids="upstream_dag",
+                task_ids="push",
+                include_prior_dates=True,
+                cutoff_dag_id=caller.dag_id,
+            )
+        ).all()
+
+        assert [x.value for x in stored_xcoms] == [json.dumps({"key": "before"})]
+
     def test_xcom_get_invalid_key(self, session, task_instance):
         """Test that getting an XCom with an invalid key raises a ValueError."""
         with pytest.raises(ValueError, match="XCom key must be a non-empty string. Received: ''"):

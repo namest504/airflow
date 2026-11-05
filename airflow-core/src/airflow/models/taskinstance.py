@@ -2953,6 +2953,9 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         if dag_id is None:
             dag_id = self.dag_id
+        # Without an explicit run_id the cutoff for prior dates is this task's own run, which
+        # belongs to this task's Dag even when pulling from another one.
+        cutoff_dag_id = self.dag_id if run_id is None else None
         if run_id is None:
             run_id = self.run_id
 
@@ -2963,6 +2966,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             task_ids=task_ids,
             map_indexes=map_indexes,
             include_prior_dates=include_prior_dates,
+            cutoff_dag_id=cutoff_dag_id,
         )
         entity = xcom_entity(query)
 

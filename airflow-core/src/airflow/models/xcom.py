@@ -329,6 +329,7 @@ class _XComOperations:
         include_node_regions: bool = True,
         producer_ids: Select | None = None,
         include_prior_dates: bool = False,
+        cutoff_dag_id: str | None = None,
         limit: int | None = None,
         try_number: int | None = None,
     ) -> XComModelSelect:
@@ -357,8 +358,11 @@ class _XComOperations:
         :param map_indexes: Only XComs from matching map indexes will be pulled.
             Pass *None* (default) to remove the filter.
         :param include_prior_dates: If *False* (default), only XComs from the
-            specified DAG run are returned. If *True*, all matching XComs are
-            returned regardless of the run it belongs to.
+            specified DAG run are returned. If *True*, XComs from runs up to and
+            including the date of ``run_id`` are returned as well.
+        :param cutoff_dag_id: The Dag that ``run_id`` belongs to when ``include_prior_dates``
+            is set. Defaults to the producer's own Dag; pass the caller's Dag when it pulls
+            from another Dag, since ``run_id`` then names one of the caller's runs.
         :param limit: Limiting returning XComs
         :param try_number: Read the XComs of this public try, current or archived, instead of
             the current attempt.
@@ -388,6 +392,7 @@ class _XComOperations:
                 region_id=region_id,
                 include_node_regions=include_node_regions,
                 include_prior_dates=include_prior_dates,
+                cutoff_dag_id=cutoff_dag_id,
                 try_number=try_number,
             )
         statement = build_xcom_read_query(producer_ids=producer_ids, key=key)
@@ -647,6 +652,7 @@ def select_producers(
     region_id=SENTINEL_REGION_ID,
     include_node_regions=True,
     include_prior_dates=False,
+    cutoff_dag_id=None,
     try_number=None,
 ):
     from airflow.models.dagrun import DagRun
@@ -681,11 +687,13 @@ def select_producers(
     elif map_indexes is not None:
         query = query.where(TaskInstance.region_index == map_indexes)
     if include_prior_dates:
+        # The cutoff is the date of ``run_id``. That run belongs to the producer Dag unless the
+        # caller pulls from another Dag, in which case ``cutoff_dag_id`` names the caller's Dag.
         requested_run = aliased(DagRun)
         cutoff = (
             select(func.coalesce(requested_run.logical_date, requested_run.run_after))
             .where(
-                requested_run.dag_id == TaskInstance.dag_id,
+                requested_run.dag_id == (TaskInstance.dag_id if cutoff_dag_id is None else cutoff_dag_id),
                 requested_run.run_id == run_id,
             )
             .correlate(TaskInstance)
