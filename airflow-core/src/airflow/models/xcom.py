@@ -360,9 +360,9 @@ class _XComOperations:
         :param include_prior_dates: If *False* (default), only XComs from the
             specified DAG run are returned. If *True*, XComs from runs up to and
             including the date of ``run_id`` are returned as well.
-        :param cutoff_dag_id: The Dag that ``run_id`` belongs to when ``include_prior_dates``
-            is set. Defaults to the producer's own Dag; pass the caller's Dag when it pulls
-            from another Dag, since ``run_id`` then names one of the caller's runs.
+        :param cutoff_dag_id: The caller's Dag when ``include_prior_dates`` is set. ``run_id``
+            is looked up in that Dag first, since by default it names the caller's own run, and
+            in the producer's Dag otherwise. *None* looks it up in the producer's Dag only.
         :param limit: Limiting returning XComs
         :param try_number: Read the XComs of this public try, current or archived, instead of
             the current attempt.
@@ -687,18 +687,21 @@ def select_producers(
     elif map_indexes is not None:
         query = query.where(TaskInstance.region_index == map_indexes)
     if include_prior_dates:
-        # The cutoff is the date of ``run_id``. That run belongs to the producer Dag unless the
-        # caller pulls from another Dag, in which case ``cutoff_dag_id`` names the caller's Dag.
-        requested_run = aliased(DagRun)
-        cutoff = (
-            select(func.coalesce(requested_run.logical_date, requested_run.run_after))
-            .where(
-                requested_run.dag_id == (TaskInstance.dag_id if cutoff_dag_id is None else cutoff_dag_id),
-                requested_run.run_id == run_id,
+        # The cutoff is the date of ``run_id``. By default that is the caller's own run, which lives
+        # in ``cutoff_dag_id`` when the caller pulls from another Dag. An explicit ``run_id`` may
+        # instead name a run of the producer Dag, so fall back to that when the caller has none.
+        def run_date(dag_id):
+            requested_run = aliased(DagRun)
+            return (
+                select(func.coalesce(requested_run.logical_date, requested_run.run_after))
+                .where(requested_run.dag_id == dag_id, requested_run.run_id == run_id)
+                .correlate(TaskInstance)
+                .scalar_subquery()
             )
-            .correlate(TaskInstance)
-            .scalar_subquery()
-        )
+
+        cutoff = run_date(TaskInstance.dag_id)
+        if cutoff_dag_id is not None:
+            cutoff = func.coalesce(run_date(cutoff_dag_id), cutoff)
         query = query.join(
             DagRun, and_(TaskInstance.dag_id == DagRun.dag_id, TaskInstance.run_id == DagRun.run_id)
         ).where(func.coalesce(DagRun.logical_date, DagRun.run_after) <= cutoff)

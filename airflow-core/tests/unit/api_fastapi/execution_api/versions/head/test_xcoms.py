@@ -981,6 +981,39 @@ def test_prior_dates_cutoff_comes_from_the_callers_run_for_cross_dag_pulls(
     assert response.json() == {"key": "key", "value": "before"}
 
 
+def test_prior_dates_with_an_explicit_run_of_the_producer_dag_still_uses_that_run(
+    client, dag_maker, session, authenticate_as
+):
+    """``xcom_pull(dag_id=other, run_id=<a run of other>, include_prior_dates=True)`` names a run of
+    the producer Dag. The cutoff is that run's date, even though the caller is in another Dag."""
+    with dag_maker("upstream_dag", serialized=True):
+        EmptyOperator(task_id="push")
+    first = dag_maker.create_dagrun(run_id="up_first", logical_date=timezone.datetime(2026, 1, 1))
+    second = dag_maker.create_dagrun(run_id="up_second", logical_date=timezone.datetime(2026, 1, 2))
+    third = dag_maker.create_dagrun(run_id="up_third", logical_date=timezone.datetime(2026, 1, 3))
+    with dag_maker("downstream_dag", serialized=True):
+        EmptyOperator(task_id="pull")
+    current = dag_maker.create_dagrun(run_id="down_current", logical_date=timezone.datetime(2026, 1, 9))
+    for run in (first, second, third):
+        XComModel.set_for_attempt(
+            task_instance_id=run.task_instances[0].id,
+            key="key",
+            value=run.run_id,
+            serialize=False,
+            session=session,
+        )
+    session.commit()
+    authenticate_as(current.task_instances[0])
+
+    response = client.get(
+        "/execution/xcoms/upstream_dag/up_second/push/key",
+        params={"include_prior_dates": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"key": "key", "value": "up_second"}
+
+
 @pytest.fixture(autouse=True)
 def reset_db():
     """Reset XCom entries."""
